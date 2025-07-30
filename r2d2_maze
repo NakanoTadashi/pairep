@@ -1,0 +1,177 @@
+import pybullet as p
+import pybullet_data
+import numpy as np
+import random
+import time
+import math
+import cv2
+
+# === 迷路生成（Prim法） ===
+def generate_maze(w, h):
+    maze = np.zeros((h, w), dtype=int)
+    start = (random.randrange(1, h, 2), random.randrange(1, w, 2))
+    maze[start] = 1
+    walls = [(start[0]+dy, start[1]+dx) for dx, dy in [(-2,0),(2,0),(0,-2),(0,2)]
+             if 0 <= start[0]+dy < h and 0 <= start[1]+dx < w]
+    while walls:
+        y, x = walls.pop(random.randint(0, len(walls)-1))
+        if maze[y][x] == 0:
+            neighbors = [(y+dy, x+dx) for dx, dy in [(-2,0),(2,0),(0,-2),(0,2)]
+                         if 0 <= y+dy < h and 0 <= x+dx < w and maze[y+dy][x+dx]==1]
+            if neighbors:
+                ny, nx = random.choice(neighbors)
+                maze[(y+ny)//2][(x+nx)//2] = 1
+                maze[y][x] = 1
+                walls += [(y+dy, x+dx) for dx, dy in [(-2,0),(2,0),(0,-2),(0,2)]
+                          if 0 <= y+dy < h and 0 <= x+dx < w and maze[y+dy][x+dx]==0]
+    return maze
+
+# === A*アルゴリズム ===
+def astar(grid, maze, start, goal):
+    from queue import PriorityQueue
+    h, w = grid.shape
+    open_set = PriorityQueue()
+    open_set.put((0, start))
+    came_from = {}
+    g_score = {start: 0}
+    while not open_set.empty():
+        _, current = open_set.get()
+        if current == goal:
+            path = []
+            while current in came_from:
+                path.append(current)
+                current = came_from[current]
+            path.reverse()
+            return path
+        for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+            ny, nx = current[0]+dy, current[1]+dx
+            if 0 <= ny < h and 0 <= nx < w and grid[ny][nx] in [2,4,5] and maze[ny][nx]==1:
+                neighbor = (ny, nx)
+                tentative = g_score[current] + 1
+                if neighbor not in g_score or tentative < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative
+                    f = tentative + abs(goal[0]-ny) + abs(goal[1]-nx)
+                    open_set.put((f, neighbor))
+    return []
+
+# === 探索マップ描画 ===
+def show_map(grid):
+    color_map = {
+        0: (0,0,0),        # 未探索（黒）
+        1: (0,0,0),        # 壁（黒）
+        2: (200,255,255),  # 通路（水色）
+        3: (0,0,255),      # 戻り（赤）
+        4: (0,0,255),      # ゴール（赤）
+        5: (255,0,0),      # スタート（青）
+    }
+    img = np.zeros((grid.shape[1]*10, grid.shape[0]*10, 3), dtype=np.uint8)
+    for y in range(grid.shape[0]):
+        for x in range(grid.shape[1]):
+            img[x*10:(x+1)*10, y*10:(y+1)*10] = color_map.get(grid[y,x], (0,0,0))
+    cv2.imshow("Map", img)
+    cv2.waitKey(30)
+
+# === 初期設定 ===
+W, H = 21, 21
+START, GOAL = (1, 1), (19, 19)
+maze = generate_maze(W, H)
+
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+p.setGravity(0, 0, -10)
+p.loadURDF("plane.urdf")
+
+wall_ids = set()
+for y in range(H):
+    for x in range(W):
+        if maze[y][x] == 0:
+            wall = p.loadURDF("cube.urdf", [x, y, 0.5], globalScaling=1)
+            wall_ids.add(wall)
+
+goal_id = p.loadURDF("sphere2.urdf", [GOAL[1]+0.5, GOAL[0]+0.5, 1.0], globalScaling=1.2)
+r2d2_id = p.loadURDF("r2d2.urdf", [START[1], START[0], 0.1])
+p.resetDebugVisualizerCamera(cameraDistance=35, cameraYaw=0, cameraPitch=-89,
+                             cameraTargetPosition=[W/2, H/2, 0])
+
+# === Q学習 ===
+ACTIONS = ['forward', 'left', 'right']
+DIRECTIONS = ['up', 'right', 'down', 'left']
+DIR_VEC = {'up':(-1,0), 'right':(0,1), 'down':(1,0), 'left':(0,-1)}
+q_table = {}
+def rotate(d,t): return DIRECTIONS[(DIRECTIONS.index(d)+(-1 if t=='left' else 1))%4]
+def angle(d): return math.radians({'up':0,'right':-90,'down':180,'left':90}[d])
+def get_state(pos, dir): return (pos[0], pos[1], dir)
+def init_q():
+    for y in range(H):
+        for x in range(W):
+            if maze[y][x] == 1:
+                for d in DIRECTIONS:
+                    q_table[(y,x,d)] = {a:0.0 for a in ACTIONS}
+init_q()
+
+explore_map = np.zeros((H, W), dtype=int)
+
+# === LiDAR修正 ===
+def lidar(pos):
+    for d in DIRECTIONS:
+        dy, dx = DIR_VEC[d]  # 注意: y, x の順
+        y, x = pos[0] + dy, pos[1] + dx
+        if 0 <= y < H and 0 <= x < W and explore_map[y][x] == 0:
+            from_pt = [pos[1]+0.5, pos[0]+0.5, 0.2]
+            to_pt = [x+0.5, y+0.5, 0.2]
+            result = p.rayTest(from_pt, to_pt)[0]
+            hit_id = result[0]
+            if hit_id in wall_ids:
+                explore_map[y][x] = 1
+            elif hit_id == goal_id:
+                explore_map[y][x] = 4
+            elif hit_id == r2d2_id:
+                explore_map[y][x] = 5
+            else:
+                explore_map[y][x] = 2
+
+# === Q学習で探索 ===
+alpha, gamma, epsilon = 0.1, 0.9, 0.2
+pos, dir = START, 'up'
+for ep in range(500):
+    for _ in range(200):
+        explore_map[pos[0], pos[1]] = 5
+        lidar(pos)
+        show_map(explore_map)
+        state = get_state(pos, dir)
+        action = random.choice(ACTIONS) if random.random()<epsilon else max(q_table[state], key=q_table[state].get)
+        if action == 'forward':
+            ny, nx = pos[0]+DIR_VEC[dir][0], pos[1]+DIR_VEC[dir][1]
+            if 0 <= ny < H and 0 <= nx < W and maze[ny][nx] == 1:
+                pos = (ny, nx)
+                reward = 1.0 if pos == GOAL else -0.01
+            else:
+                reward = -1.0
+            next_state = get_state(pos, dir)
+        else:
+            dir = rotate(dir, action)
+            reward = -0.02
+            next_state = get_state(pos, dir)
+        q_table[state][action] += alpha * (reward + gamma * max(q_table[next_state].values()) - q_table[state][action])
+        orn = p.getQuaternionFromEuler([0, 0, angle(dir)])
+        p.resetBasePositionAndOrientation(r2d2_id, [pos[1], pos[0], 0.1], orn)
+        time.sleep(0.01)
+        if pos == GOAL:
+            break
+    if pos == GOAL:
+        break
+
+# === A* でスタートへ自然に戻る ===
+path = astar(explore_map, maze, GOAL, START)
+for y, x in path:
+    explore_map[y][x] = 3
+    if explore_map[y][x] != 3:
+        p.loadURDF("sphere2.urdf", [x, y, 0.05], globalScaling=0.3)
+    p.resetBasePositionAndOrientation(r2d2_id, [x, y, 0.1], [0,0,0,1])
+    show_map(explore_map)
+    time.sleep(0.1)
+
+cv2.destroyAllWindows()
+p.disconnect()
+
